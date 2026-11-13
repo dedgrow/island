@@ -1,5 +1,5 @@
 # Media bridge for island.py.
-# stdout: one JSON line {title, artist, playing, cover(base64), pos, dur (seconds)} whenever the media session changes.
+# stdout: one JSON line {title, artist, playing, cover(base64), pos, dur (seconds), app (player id)} whenever the media session changes.
 # stdin:  commands "play" / "next" / "prev" / "seek <seconds>" sent straight to that session (no fake media keys).
 param([int]$ParentPid = 0)
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -23,7 +23,12 @@ function Get-Cover($props) {
     try {
         if (-not $props.Thumbnail) { return '' }
         $ws = Await ($props.Thumbnail.OpenReadAsync()) $TStream
-        return [CoverReader]::Read($ws)
+        $b64 = [CoverReader]::Read($ws)
+        # плеер может отдать обложку ещё недокачанной (картинка «наполовину»): у целого JPEG в конце метка FF D9
+        $b = [Convert]::FromBase64String($b64)
+        if ($b.Length -lt 4) { return '' }
+        if ($b[0] -eq 0xFF -and $b[1] -eq 0xD8 -and -not ($b[-2] -eq 0xFF -and $b[-1] -eq 0xD9)) { return '' }
+        return $b64
     } catch { return '' }
 }
 
@@ -63,18 +68,19 @@ while ($true) {
     }
 
     if ($n % 4 -eq 0) {
-        $info = [ordered]@{ title = ''; artist = ''; playing = $false; cover = ''; pos = 0; dur = 0 }
+        $info = [ordered]@{ title = ''; artist = ''; playing = $false; cover = ''; pos = 0; dur = 0; app = '' }
         try {
             $s = Get-Session
             if ($s) {
                 $p = Await ($s.TryGetMediaPropertiesAsync()) $TProps
                 $info.title = [string]$p.Title
                 $info.artist = [string]$p.Artist
+                $info.app = [string]$s.SourceAppUserModelId
                 $info.playing = ($s.GetPlaybackInfo().PlaybackStatus -eq 'Playing')
                 $key = "$($info.title)|$($info.artist)"
                 if ($key -ne $coverKey) { $coverKey = $key; $cover = ''; $coverTries = 0 }
                 # players often publish the picture a moment after the title, so retry a few times
-                if (-not $cover -and $coverTries -lt 10) { $coverTries++; $cover = Get-Cover $p }
+                if (-not $cover -and $coverTries -lt 25) { $coverTries++; $cover = Get-Cover $p }
                 $info.cover = $cover
                 $tl = $s.GetTimelineProperties()
                 $dur = ($tl.EndTime - $tl.StartTime).TotalSeconds
