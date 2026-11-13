@@ -5,6 +5,7 @@
 Запуск: pythonw island.py   Закрыть: правый клик по острову.
 """
 import base64
+import colorsys
 import ctypes
 import ctypes.wintypes as wt
 import io
@@ -110,6 +111,24 @@ def fade(img, f):
     return out
 
 
+def fmt_time(sec):
+    sec = int(sec)
+    return f"{sec // 60}:{sec % 60:02d}"
+
+
+def accent_from(img):
+    """Яркий цвет обложки: среднее по насыщенным пикселям, приподнятое по яркости. Серая обложка -> ACCENT."""
+    small = img.convert("RGB").resize((24, 24))
+    rgb, hsv = small.tobytes(), small.convert("HSV").tobytes()
+    picks = [rgb[i:i + 3] for i in range(0, len(rgb), 3) if hsv[i + 1] > 90 and hsv[i + 2] > 90]
+    if len(picks) < 20:
+        return ACCENT
+    r, g, b = (sum(p[c] for p in picks) / len(picks) / 255 for c in range(3))
+    h, s, v = colorsys.rgb_to_hsv(r, g, b)
+    r, g, b = colorsys.hsv_to_rgb(h, max(s, 0.5), max(v, 0.9))
+    return int(r * 255), int(g * 255), int(b * 255)
+
+
 def closeness(w, h, target):
     """1 — форма почти в целевом размере, 0 — далеко (тогда контент не показываем)."""
     tw, th = target
@@ -161,15 +180,19 @@ class Card:
         f = lambda name, px: ImageFont.truetype(os.path.join(FONTS, name), max(1, int(px * k * SS)))
         self.f_title, self.f_artist = f("segoeuib.ttf", 16), f("segoeui.ttf", 13.5)
         self.f_info, self.f_sym = f("segoeui.ttf", 13), f("seguisym.ttf", 13)
-        self.f_note = f("seguisym.ttf", 30)
+        self.f_note, self.f_time = f("seguisym.ttf", 30), f("segoeui.ttf", 11.5)
         self.buttons = {}  # имя -> (x0, y0, x1, y1) в координатах карточки
-        self.small_cover = None
+        # полоска прогресса справа от кнопок: (x начала, x конца, y) в координатах карточки
+        self.bar = (252 * k, self.w - 20 * k, 92 * k)
+        self.set_cover(None)
 
     def set_cover(self, cover):
         k = self.k
         self.cover = cover
         size = int(24 * k)
         self.small_cover = rounded(cover, size, int(7 * k)) if cover else None
+        self.accent = accent_from(cover) if cover else ACCENT
+        self.bg = tuple(int(b * 0.88 + a * 0.12) for b, a in zip(BG, self.accent))  # фон чуть в цвет обложки
 
     def render_big(self, clock, weather, media):
         s = self.k * SS
@@ -225,13 +248,30 @@ class Card:
                 amp = 0.25
             bh = 16 * s * amp
             bx = W - 18 * s - (3 - i) * 6 * s
-            d.rounded_rectangle((bx, H / 2 - bh / 2, bx + 3.5 * s, H / 2 + bh / 2), radius=1.7 * s, fill=ACCENT)
+            d.rounded_rectangle((bx, H / 2 - bh / 2, bx + 3.5 * s, H / 2 + bh / 2), radius=1.7 * s, fill=self.accent)
         img = img.resize((self.pw, self.ph), Image.LANCZOS)
         if self.small_cover:
             img.alpha_composite(self.small_cover, (int(7 * k), (self.ph - self.small_cover.height) // 2))
         else:
-            ImageDraw.Draw(img).ellipse((10 * k, self.ph / 2 - 4 * k, 18 * k, self.ph / 2 + 4 * k), fill=ACCENT)
+            ImageDraw.Draw(img).ellipse((10 * k, self.ph / 2 - 4 * k, 18 * k, self.ph / 2 + 4 * k), fill=self.accent)
         return img
+
+    def render_progress(self, pos, dur):
+        """Время и полоска прогресса -> (картинка, x, y) в координатах карточки."""
+        k, s = self.k, self.k * SS
+        bx0, bx1, by = self.bar
+        x0, y0 = int(bx0 - 6 * k), int(by - 26 * k)
+        W, H = int(bx1 + 6 * k) - x0, int(36 * k)
+        img = Image.new("RGBA", (W * SS, H * SS), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        L, R, Y = (bx0 - x0) * SS, (bx1 - x0) * SS, (by - y0) * SS
+        d.text((R, Y - 13 * s), f"{fmt_time(pos)} / {fmt_time(dur)}", font=self.f_time, fill=DIM, anchor="rm")
+        d.rounded_rectangle((L, Y - 2 * s, R, Y + 2 * s), radius=2 * s, fill=(70, 70, 78))
+        fx = L + (R - L) * max(0.0, min(1.0, pos / dur))
+        if fx > L + 4 * s:
+            d.rounded_rectangle((L, Y - 2 * s, fx, Y + 2 * s), radius=2 * s, fill=self.accent)
+        d.ellipse((fx - 5 * s, Y - 5 * s, fx + 5 * s, Y + 5 * s), fill=FG)
+        return img.resize((W, H), Image.LANCZOS), x0, y0
 
 
 class Island:
@@ -272,6 +312,8 @@ class Island:
         self.last_title = None
         # своя плавная прозрачность контента: не повторяет покачивание формы, иначе текст мигает
         self.fade = {"big": 0.0, "pill": 0.0}
+        self.media_t = time.time()
+        self.prog_key = self.prog = None
         self.content_key = None
         self.big_img = None
         self.was_drawn_empty = False
@@ -292,9 +334,16 @@ class Island:
     def read_media(self):
         for line in self.ps.stdout:
             try:
-                self.media = json.loads(line)
+                self.media, self.media_t = json.loads(line), time.time()
             except ValueError:
                 pass
+
+    def position(self):
+        """Позиция трека сейчас: между сообщениями плеера досчитываем сами, чтобы полоска ехала плавно."""
+        m = self.media
+        dur = m.get("dur", 0)
+        pos = m.get("pos", 0) + (time.time() - self.media_t if m.get("playing") else 0)
+        return min(pos, dur), dur
 
     def read_weather(self):
         url = (f"https://api.open-meteo.com/v1/forecast?latitude={LAT}&longitude={LON}"
@@ -355,6 +404,10 @@ class Island:
         for name, (x0, y0, x1, y1) in self.card.buttons.items():
             if x0 <= x <= x1 and y0 <= y <= y1:
                 self.send(name)
+        pos, dur = self.position()
+        bx0, bx1, by = self.card.bar
+        if dur > 0 and bx0 - 6 * self.k <= x <= bx1 + 6 * self.k and abs(y - by) <= 10 * self.k:
+            self.send(f"seek {dur * min(1.0, max(0.0, (x - bx0) / (bx1 - bx0))):.1f}")
 
     def quit(self):
         ctypes.windll.winmm.timeEndPeriod(1)
@@ -443,13 +496,20 @@ class Island:
         # размытие + порог = капли «слипаются» с островом, как жидкость
         mask = mask.filter(ImageFilter.GaussianBlur(6 * k)).point(GOO_LUT)
 
-        frame = Image.new("RGBA", (self.ww, self.wh), BG + (0,))
+        frame = Image.new("RGBA", (self.ww, self.wh), self.card.bg + (0,))
         frame.putalpha(mask.point(lambda v: v * BG_ALPHA // 255))
 
         layer = Image.new("RGBA", (self.ww, self.wh), (0, 0, 0, 0))
         f = self.fade["big"]
         if f > 0.01:
             layer.alpha_composite(fade(self.big_img, f), (int(cx - self.card.w / 2), self.top))
+            pos, dur = self.position()
+            if dur > 0:
+                key = (round(pos * 4), dur, self.card.accent)  # перерисовываем полоску 4 раза в секунду
+                if key != self.prog_key:
+                    self.prog_key, self.prog = key, self.card.render_progress(pos, dur)
+                img, px, py = self.prog
+                layer.alpha_composite(fade(img, f), (int(cx - self.card.w / 2 + px), self.top + py))
         f = self.fade["pill"]
         if f > 0.01:
             layer.alpha_composite(fade(self.card.render_pill(now, playing), f), (int(cx - self.card.pw / 2), self.top))
@@ -472,9 +532,16 @@ def selftest():
     img = card.render_big("12:34", "☀ 5°", {"title": "Очень длинное название трека " * 3, "artist": "Кто-то", "playing": True})
     assert img.size == (card.w, card.h) and set(card.buttons) == {"prev", "play", "next"}
     assert card.render_pill(1.0, True).size == (card.pw, card.ph)
+    assert fmt_time(83) == "1:23" and fmt_time(0) == "0:00" and fmt_time(600.9) == "10:00"
+    assert accent_from(Image.new("RGB", (50, 50), (120, 120, 120))) == ACCENT  # серая обложка
+    r, g, b = card.accent  # розовая обложка -> розовый акцент
+    assert r > 200 and b > 120 and g < r and card.bg != BG
+    bar, px, py = card.render_progress(83, 185)
     if len(sys.argv) > 2:
-        bg = Image.new("RGBA", img.size, BG + (BG_ALPHA,))
-        Image.alpha_composite(bg, img).save(sys.argv[2])
+        bg = Image.new("RGBA", img.size, card.bg + (BG_ALPHA,))
+        out = Image.alpha_composite(bg, img)
+        out.alpha_composite(bar, (px, py))
+        out.save(sys.argv[2])
     print("ok")
 
 

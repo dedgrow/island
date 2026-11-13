@@ -1,6 +1,6 @@
 # Media bridge for island.py.
-# stdout: one JSON line {title, artist, playing, cover(base64)} whenever the current Windows media session changes.
-# stdin:  commands "play" / "next" / "prev" sent straight to that session (no fake media keys).
+# stdout: one JSON line {title, artist, playing, cover(base64), pos, dur (seconds)} whenever the media session changes.
+# stdin:  commands "play" / "next" / "prev" / "seek <seconds>" sent straight to that session (no fake media keys).
 param([int]$ParentPid = 0)
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
@@ -47,10 +47,13 @@ while ($true) {
         try {
             $s = Get-Session
             if ($s) {
-                $op = switch ($cmd.Trim()) {
-                    'play' { $s.TryTogglePlayPauseAsync() }
-                    'next' { $s.TrySkipNextAsync() }
-                    'prev' { $s.TrySkipPreviousAsync() }
+                $c = $cmd.Trim()
+                $op = if ($c -eq 'play') { $s.TryTogglePlayPauseAsync() }
+                elseif ($c -eq 'next') { $s.TrySkipNextAsync() }
+                elseif ($c -eq 'prev') { $s.TrySkipPreviousAsync() }
+                elseif ($c -like 'seek *') {
+                    $sec = [double]::Parse($c.Substring(5), [Globalization.CultureInfo]::InvariantCulture)
+                    $s.TryChangePlaybackPositionAsync([long]($sec * 10000000))  # 100-ns ticks
                 }
                 if ($op) { Await $op ([bool]) | Out-Null }
             }
@@ -60,7 +63,7 @@ while ($true) {
     }
 
     if ($n % 4 -eq 0) {
-        $info = [ordered]@{ title = ''; artist = ''; playing = $false; cover = '' }
+        $info = [ordered]@{ title = ''; artist = ''; playing = $false; cover = ''; pos = 0; dur = 0 }
         try {
             $s = Get-Session
             if ($s) {
@@ -73,6 +76,14 @@ while ($true) {
                 # players often publish the picture a moment after the title, so retry a few times
                 if (-not $cover -and $coverTries -lt 10) { $coverTries++; $cover = Get-Cover $p }
                 $info.cover = $cover
+                $tl = $s.GetTimelineProperties()
+                $dur = ($tl.EndTime - $tl.StartTime).TotalSeconds
+                $pos = $tl.Position.TotalSeconds
+                # players report position only now and then; add the time since that report while playing
+                $since = ([DateTimeOffset]::Now - $tl.LastUpdatedTime).TotalSeconds
+                if ($info.playing -and $since -gt 0 -and $since -lt $dur) { $pos += $since }
+                $info.pos = [math]::Round([math]::Max(0, [math]::Min($pos, $dur)), 1)
+                $info.dur = [math]::Round([math]::Max(0, $dur), 1)
             }
         } catch {}
         $json = $info | ConvertTo-Json -Compress
