@@ -174,6 +174,30 @@ def same_art(a, b):
     return sum(abs(p - q) for p, q in zip(x, y)) / len(x) < 22
 
 
+LRC_TAG = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\]")
+
+
+def parse_lrc(text):
+    """Текст LRC -> [(секунда, строка), ...] по времени. У строки может быть несколько меток (припев)."""
+    out = []
+    for line in text.splitlines():
+        words = LRC_TAG.sub("", line).strip()
+        out += [(int(m) * 60 + float(s), words) for m, s in LRC_TAG.findall(line)]
+    return sorted(out)
+
+
+def current_lyric(lines, pos):
+    """-> (текущая строка, следующая, сколько текущей «спето» 0..1)."""
+    i = sum(1 for t, _ in lines if t <= pos) - 1
+    nxt = lines[i + 1][1] if i + 1 < len(lines) else ""
+    if i < 0:
+        return "", nxt, 0.0
+    t0, cur = lines[i]
+    t1 = lines[i + 1][0] if i + 1 < len(lines) else t0 + 4
+    # заливка кончается чуть раньше следующей строки; длинный проигрыш не растягивает её на полминуты
+    return cur, nxt, max(0.0, min(1.0, (pos - t0) / max(0.3, min(0.9 * (t1 - t0), 6))))
+
+
 def closeness(w, h, target):
     """1 — форма почти в целевом размере, 0 — далеко (тогда контент не показываем)."""
     tw, th = target
@@ -394,6 +418,62 @@ class Square:
         self.size = Spring(0.0)
         self.drops, self.next_drop = [], 0.0  # капля: [время, длительность, сдвиг x, радиус]
         self.bg = self.sharp = None
+        bold = os.path.join(FONTS, "segoeuib.ttf")
+        self.f_lyric = ImageFont.truetype(bold, max(8, int(self.S * 0.075)))
+        self.f_next = ImageFont.truetype(bold, max(8, int(self.S * 0.055)))
+        self.lyr_cache = {}
+        # затемнение под текстом внизу обложки: снизу темнее, бока мягко сходят на нет
+        w, h = int(self.S * 0.92), int(self.S * 0.36)
+        sides = Image.new("L", (w, h), 0)
+        ImageDraw.Draw(sides).rectangle((w * 0.06, -h, w * 0.94, h * 0.88), fill=255)
+        alpha = ImageChops.multiply(Image.linear_gradient("L").resize((w, h)), sides.filter(ImageFilter.GaussianBlur(w * 0.04)))
+        self.shade = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        self.shade.putalpha(alpha.point(lambda v: v * 170 // 255))
+        self.shade_top = self.shade.transpose(Image.FLIP_TOP_BOTTOM)  # то же затемнение под названием сверху
+
+    def lyric_imgs(self, text, small):
+        """Строка -> (тусклая, яркая) картинки. Длинную ужимаем до 75% размера, дальше — «…»."""
+        key = (text, small)
+        if key not in self.lyr_cache:
+            if len(self.lyr_cache) > 8:
+                self.lyr_cache.clear()
+            font, maxw = (self.f_next if small else self.f_lyric), self.S * 0.84
+            if font.getlength(text) > maxw:
+                font = font.font_variant(size=max(int(font.size * 0.75), int(font.size * maxw / font.getlength(text))))
+                text = fit(text, font, maxw)
+            size = (int(font.getlength(text)) + 4, int(font.size * 1.45))
+            pair = []
+            for a in (110 if not small else 90, 255):
+                im = Image.new("RGBA", size, (0, 0, 0, 0))
+                ImageDraw.Draw(im).text((2, size[1] / 2), text, font=font, fill=(255, 255, 255, a), anchor="lm")
+                pair.append(im)
+            self.lyr_cache[key] = pair
+        return self.lyr_cache[key]
+
+    def draw_title(self, out, cx, cy, title, artist):
+        S = self.S
+        top = cy - S / 2 + S * 0.04
+        out.alpha_composite(self.shade_top, (int(cx - self.shade_top.width / 2), int(top)))
+        _, name = self.lyric_imgs(title, False)
+        out.alpha_composite(name, (int(cx - name.width / 2), int(top + S * 0.03)))
+        if artist:
+            dim, _ = self.lyric_imgs(artist, True)
+            out.alpha_composite(dim, (int(cx - dim.width / 2), int(top + S * 0.03 + name.height * 0.9)))
+
+    def draw_lyric(self, out, cx, cy, cur, nxt, fill):
+        S = self.S
+        bottom = cy + S / 2 - S * 0.04
+        out.alpha_composite(self.shade, (int(cx - self.shade.width / 2), int(bottom - self.shade.height)))
+        if nxt:
+            dim, _ = self.lyric_imgs(nxt, True)
+            out.alpha_composite(dim, (int(cx - dim.width / 2), int(bottom - S * 0.04 - dim.height)))
+        if cur:
+            dim, bright = self.lyric_imgs(cur, False)
+            x, y = int(cx - dim.width / 2), int(bottom - S * 0.12 - dim.height)
+            out.alpha_composite(dim, (x, y))
+            fw = int(dim.width * fill)  # караоке: яркая часть растёт слева направо
+            if fw > 0:
+                out.alpha_composite(bright.crop((0, 0, fw, bright.height)), (x, y))
 
     def set_cover(self, cover):
         W, H, S = self.W, self.H, self.S
@@ -414,7 +494,7 @@ class Square:
         self.sharp = sharp
         self.shifted = {}
 
-    def render(self, now, show, f=1.0):
+    def render(self, now, show, f=1.0, lyric=None, title=None):
         S, W, H, top = self.S, self.W, self.H, self.top
         self.size.step(S if show else 0.0, damp=0.55, f=f)  # спокойнее острова: перелёт ~1%, квадрат не «дышит»
         s = max(0.0, self.size.x)
@@ -461,6 +541,10 @@ class Square:
             # обложку тоже обрезаем «жидкой» маской (края прозрачные, так что за маску ничего не вылезает)
             sharp.putalpha(ImageChops.multiply(sharp.getchannel("A"), mask.crop((px, py, px + sharp.width, py + sharp.height))))
             out.alpha_composite(sharp, (px, py))
+            if lyric and s > S * 0.95:  # текст только на раскрытом квадрате
+                self.draw_lyric(out, cx, cy, *lyric)
+            if title and title[0] and s > S * 0.95:
+                self.draw_title(out, cx, cy, *title)
         return out
 
     def settled_hidden(self):
@@ -515,6 +599,7 @@ class Island:
         self.media = {"title": "", "artist": "", "playing": False, "cover": ""}
         self.cover_b64 = ""
         self.hq_ready = None  # (cover_b64, крупная обложка) из fetch_hq
+        self.lyrics_key = self.lyrics = None  # (название, исполнитель) и (ключ, [(сек, строка)]) из fetch_lyrics
         self.weather = ""
         self.mode = "hidden"  # hidden / pill / big
         self.sw_, self.sh = Spring(PILL[0] * k * 0.5), Spring(0.0)
@@ -537,6 +622,7 @@ class Island:
         self.content_key = None
         self.big_img = None
         self.was_drawn_empty = False
+        self.through = False  # сейчас клики проходят сквозь остров
 
         r.bind("<Button-1>", self.click)
         r.bind("<Button-3>", self.menu)
@@ -601,6 +687,25 @@ class Island:
                         return
             except Exception:
                 pass  # нет сети или не нашлось — остаётся обложка от плеера
+
+    def fetch_lyrics(self, key, dur):
+        """Текст с таймингом строк из LRCLIB (бесплатно, без ключа). Не нашлось — пустой список, караоке молчит."""
+        lines = []
+        # точный поиск часто находит только текст без тайминга, а версия с таймингом лежит под «Название (…)» —
+        # её находит свободный поиск; оттуда берём только того же исполнителя
+        for params in ({"track_name": key[0], "artist_name": key[1]}, {"q": f"{key[1]} {key[0]}"}):
+            try:
+                url = "https://lrclib.net/api/search?" + urllib.parse.urlencode(params)
+                with urllib.request.urlopen(url, timeout=10) as resp:
+                    found = [r for r in json.load(resp) if r.get("syncedLyrics")
+                             and (r.get("artistName") or "").lower() == key[1].lower()]
+            except Exception:
+                continue
+            if found:  # из нескольких версий берём ближайшую по длине трека
+                best = min(found, key=lambda r: abs((r.get("duration") or 0) - dur)) if dur else found[0]
+                lines = parse_lrc(best["syncedLyrics"])
+                break
+        self.lyrics = (key, lines)
 
     def set_city(self, name):
         q = urllib.parse.urlencode({"name": name, "count": 1, "language": "ru"})
@@ -692,6 +797,18 @@ class Island:
         if dur > 0 and bx0 - 6 * self.k <= x <= bx1 + 6 * self.k and abs(y - by) <= 10 * self.k:
             self.send(f"seek {dur * min(1.0, max(0.0, (x - bx0) / (bx1 - bx0))):.1f}")
 
+    def hit_zone(self):
+        """Курсор над кнопкой, полоской, часами или обложкой раскрытого острова? Остальное пропускает клики насквозь."""
+        x, y = self.cursor()
+        x -= self.wx + (self.ww - self.card.w) / 2
+        y -= self.top
+        k = self.k
+        bx0, bx1, by = self.card.bar
+        zones = list(self.card.buttons.values()) + [
+            self.card.info_box, (bx0 - 6 * k, by - 10 * k, bx1 + 6 * k, by + 10 * k),
+            (18 * k, 18 * k, 106 * k, 106 * k)]  # обложка: на ней правый клик (меню) и колёсико
+        return any(x0 <= x <= x1 and y0 <= y <= y1 for x0, y0, x1, y1 in zones)
+
     def wheel(self, e):
         vk = 0xAF if e.delta > 0 else 0xAE  # VK_VOLUME_UP / VK_VOLUME_DOWN: Windows сам покажет громкость
         user32.keybd_event(vk, 0, 0, 0)
@@ -721,6 +838,12 @@ class Island:
         self.square_var = tk.BooleanVar(value=self.cfg.get("square", True))
         m.add_checkbutton(label="Квадрат с обложкой", variable=self.square_var,
                           command=lambda: self.set_cfg(square=self.square_var.get()))
+        self.karaoke_var = tk.BooleanVar(value=self.cfg.get("karaoke", False))
+        m.add_checkbutton(label="Караоке на квадрате", variable=self.karaoke_var,
+                          command=lambda: self.set_cfg(karaoke=self.karaoke_var.get()))
+        self.sq_title_var = tk.BooleanVar(value=self.cfg.get("sq_title", False))
+        m.add_checkbutton(label="Название на квадрате", variable=self.sq_title_var,
+                          command=lambda: self.set_cfg(sq_title=self.sq_title_var.get()))
         m.add_command(label="Город для погоды…", command=self.ask_city)
         m.add_separator()
         m.add_command(label="Выход", command=self.quit)
@@ -773,6 +896,12 @@ class Island:
             self.card.set_cover(hq[1])
             self.content_key = None
 
+        lkey = (m.get("title", ""), m.get("artist", "")) if self.cfg.get("karaoke") else None
+        if lkey != self.lyrics_key:  # новый трек или караоке включили
+            self.lyrics_key = lkey
+            if lkey and lkey[0]:
+                threading.Thread(target=self.fetch_lyrics, args=(lkey, m.get("dur", 0)), daemon=True).start()
+
         seq = user32.GetClipboardSequenceNumber()
         if seq != self.clip_seq:
             self.clip_seq = seq
@@ -789,6 +918,12 @@ class Island:
             if mode != "hidden" and self.mode != "hidden":
                 self.drip(now)  # «бульк» при смене формы
             self.mode = mode
+        # раскрытый остров: клики мимо кнопок проходят в окно под ним (WS_EX_TRANSPARENT включаем/выключаем на лету)
+        through = mode == "big" and not self.hit_zone()
+        if through != self.through:
+            self.through = through
+            ex = user32.GetWindowLongW(self.hwnd, -20)
+            user32.SetWindowLongW(self.hwnd, -20, (ex | 0x20) if through else (ex & ~0x20))
         if mode != "hidden" and playing and now > self.next_bubble:
             self.drip(now, small=True)  # пока играет музыка — иногда булькает
             self.next_bubble = now + random.uniform(2.0, 3.5)
@@ -866,7 +1001,12 @@ class Island:
                 off_since = None if want else (off_since or now)
                 show = want or (self.sq.size.x > 1 and now - off_since < 0.5)
                 if self.sq.bg is not None and (show or not self.sq.settled_hidden()):
-                    push(self.sq_hwnd, self.sq.render(now, show, f), self.sq_x, self.sq_y)
+                    lyr, lyric = self.lyrics, None
+                    if lyr and lyr[1] and lyr[0] == self.lyrics_key:
+                        lyric = current_lyric(lyr[1], self.position()[0])
+                    m = self.media
+                    title = (m.get("title", ""), m.get("artist", "")) if self.cfg.get("sq_title") else None
+                    push(self.sq_hwnd, self.sq.render(now, show, f, lyric, title), self.sq_x, self.sq_y)
                     shown = True
                 elif shown and not show and self.sq.settled_hidden():
                     push(self.sq_hwnd, Image.new("RGBA", (self.sq.W, self.sq.H), (0, 0, 0, 0)), self.sq_x, self.sq_y)
@@ -971,11 +1111,21 @@ def selftest():
     for n in range(60, 160):
         sq.render(n / 30, False)
     assert sq.settled_hidden()
+    lines = parse_lrc("[ar:x]\n[00:01.50]Раз\n[00:05.00][01:00.00]Два три\n[00:09.00]")
+    assert lines == [(1.5, "Раз"), (5.0, "Два три"), (9.0, ""), (60.0, "Два три")]
+    assert current_lyric(lines, 0.5) == ("", "Раз", 0.0)
+    cur, nxt, fill = current_lyric(lines, 3.0)
+    assert cur == "Раз" and nxt == "Два три" and 0.4 < fill < 0.6
+    assert current_lyric(lines, 61)[2] > 0 and current_lyric(lines, 100) == ("Два три", "", 1.0)
+    for n in range(75):  # с текстом не падает, длинная строка влезает в квадрат
+        frame = sq.render(n / 30, True, lyric=("Очень длинная строка песни " * 4, "Следующая", 0.5))
+    assert sq.lyric_imgs("Очень длинная строка песни " * 4, False)[0].width <= sq.S * 0.85
     if len(sys.argv) > 3:
         sq2 = Square(300)
         sq2.set_cover(cover)
         for n in range(75):
-            frame = sq2.render(n / 30, True)
+            frame = sq2.render(n / 30, True, lyric=("Строка, которую поют", "А это следующая", 0.45),
+                               title=("Название трека", "Исполнитель"))
         Image.alpha_composite(Image.new("RGBA", frame.size, (10, 10, 14, 255)), frame).save(sys.argv[3])
     card.theme = THEMES["Красный"]
     card.set_cover(cover)
